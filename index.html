@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HTML Extractor Iframe Viewer</title>
+  <style>
+    /* Transparent background */
+    html, body {
+      height: 100%;
+      margin: 0;
+      background: transparent;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    }
+
+    /* Full-page iframe */
+    #viewer {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      border: 0;
+      display: none;
+      background: transparent;
+    }
+
+    /* Overlay UI */
+    #ui {
+      position: fixed;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      background: rgba(0,0,0,0.15);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+    }
+
+    .card {
+      width: min(720px, 100%);
+      border-radius: 18px;
+      padding: 18px;
+      background: rgba(255,255,255,0.75);
+      box-shadow: 0 20px 60px rgba(0,0,0,0.2);
+      border: 1px solid rgba(255,255,255,0.6);
+    }
+
+    .row {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+
+    input[type="url"]{
+      flex: 1;
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid rgba(0,0,0,0.12);
+      outline: none;
+      font-size: 14px;
+      background: rgba(255,255,255,0.9);
+    }
+
+    button{
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 0;
+      cursor: pointer;
+      font-weight: 600;
+      background: #111827;
+      color: white;
+      font-size: 14px;
+    }
+
+    button:disabled{
+      opacity: 0.65;
+      cursor: not-allowed;
+    }
+
+    .hint, .error {
+      margin-top: 12px;
+      font-size: 13px;
+      line-height: 1.35;
+      color: rgba(17,24,39,0.8);
+    }
+
+    .error {
+      color: #b91c1c;
+      white-space: pre-wrap;
+    }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <div class="card">
+      <div class="row">
+        <input id="urlInput" type="url" placeholder="https://example.com" autocomplete="off" spellcheck="false" />
+        <button id="goBtn">Load</button>
+      </div>
+
+      <div class="hint">
+        This fetches the site’s <span class="mono">HTML source</span>, rewrites linked assets to absolute URLs, and renders it in an iframe via <span class="mono">srcdoc</span>.<br/>
+        <b>Note:</b> Many sites block cross-origin HTML fetching (CORS) and/or block scripts/styles in iframes (CSP).
+      </div>
+      <div id="err" class="error" style="display:none;"></div>
+    </div>
+  </div>
+
+  <iframe id="viewer" sandbox="allow-scripts allow-forms allow-popups allow-modals allow-downloads allow-pointer-lock allow-top-navigation-by-user-activation allow-same-origin"></iframe>
+
+  <script>
+    const ui = document.getElementById("ui");
+    const urlInput = document.getElementById("urlInput");
+    const goBtn = document.getElementById("goBtn");
+    const viewer = document.getElementById("viewer");
+    const errBox = document.getElementById("err");
+
+    // OPTIONAL: If you later deploy a proxy, set this to your proxy endpoint:
+    // Example: const PROXY = "https://your-worker.example.workers.dev/?url=";
+    const PROXY = ""; // "" = direct fetch (works only when the target allows CORS)
+
+    function showError(msg) {
+      errBox.style.display = "block";
+      errBox.textContent = msg;
+    }
+
+    function clearError() {
+      errBox.style.display = "none";
+      errBox.textContent = "";
+    }
+
+    function normalizeUrl(input) {
+      let u = (input || "").trim();
+      if (!u) return "";
+      if (!/^https?:\/\//i.test(u)) u = "https://" + u;
+      try { return new URL(u).toString(); } catch { return ""; }
+    }
+
+    function absolutizeAttr(el, attr, baseUrl) {
+      const val = el.getAttribute(attr);
+      if (!val) return;
+
+      // leave anchors, data:, blob:, mailto:, tel:, javascript:
+      const lower = val.trim().toLowerCase();
+      if (
+        lower.startsWith("#") ||
+        lower.startsWith("data:") ||
+        lower.startsWith("blob:") ||
+        lower.startsWith("mailto:") ||
+        lower.startsWith("tel:") ||
+        lower.startsWith("javascript:")
+      ) return;
+
+      try {
+        const abs = new URL(val, baseUrl).toString();
+        el.setAttribute(attr, abs);
+      } catch {}
+    }
+
+    function rewriteHtmlToRunStandalone(htmlText, pageUrl) {
+      const baseUrl = new URL(pageUrl);
+
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(htmlText, "text/html");
+
+      // Ensure <base> exists so relative URLs inside CSS/HTML resolve better.
+      // We'll also still rewrite common attrs to be safe.
+      let baseTag = doc.querySelector("base");
+      if (!baseTag) {
+        baseTag = doc.createElement("base");
+        const head = doc.head || doc.documentElement;
+        head.insertBefore(baseTag, head.firstChild);
+      }
+      baseTag.setAttribute("href", baseUrl.toString());
+
+      // Rewrite common URL attributes
+      const urlAttrs = [
+        ["a", "href"],
+        ["link", "href"],
+        ["script", "src"],
+        ["img", "src"],
+        ["img", "srcset"],
+        ["source", "src"],
+        ["source", "srcset"],
+        ["video", "src"],
+        ["audio", "src"],
+        ["iframe", "src"],
+        ["embed", "src"],
+        ["object", "data"],
+        ["form", "action"],
+      ];
+
+      for (const [sel, attr] of urlAttrs) {
+        doc.querySelectorAll(sel).forEach(el => {
+          if (attr === "srcset") {
+            const srcset = el.getAttribute("srcset");
+            if (!srcset) return;
+            const parts = srcset.split(",").map(s => s.trim()).filter(Boolean);
+            const rewritten = parts.map(part => {
+              // "url 2x" or "url 640w"
+              const m = part.match(/^(\S+)(\s+.+)?$/);
+              if (!m) return part;
+              const urlPart = m[1];
+              const desc = m[2] || "";
+              try {
+                const abs = new URL(urlPart, baseUrl).toString();
+                return abs + desc;
+              } catch {
+                return part;
+              }
+            }).join(", ");
+            el.setAttribute("srcset", rewritten);
+          } else {
+            absolutizeAttr(el, attr, baseUrl);
+          }
+        });
+      }
+
+      // Rewrite CSS url(...) inside <style> blocks (best-effort)
+      doc.querySelectorAll("style").forEach(styleEl => {
+        const css = styleEl.textContent || "";
+        styleEl.textContent = css.replace(/url\(\s*(['"]?)(.*?)\1\s*\)/gi, (m, q, u) => {
+          const lower = (u || "").trim().toLowerCase();
+          if (!u || lower.startsWith("data:") || lower.startsWith("blob:") || lower.startsWith("http://") || lower.startsWith("https://")) {
+            return m;
+          }
+          try {
+            const abs = new URL(u, baseUrl).toString();
+            return `url("${abs}")`;
+          } catch {
+            return m;
+          }
+        });
+      });
+
+      // Some pages depend on being top-level; we can try to reduce breakage:
+      // - remove <meta http-equiv="Content-Security-Policy"> if present (only helps when CSP is in HTML, not headers)
+      doc.querySelectorAll('meta[http-equiv="Content-Security-Policy"]').forEach(m => m.remove());
+
+      // Make background transparent if the page uses default white body/html.
+      // (This is subjective; remove if you want original background.)
+      const style = doc.createElement("style");
+      style.textContent = `
+        html, body { background: transparent !important; }
+      `;
+      (doc.head || doc.documentElement).appendChild(style);
+
+      // Serialize
+      const out = "<!doctype html>\n" + doc.documentElement.outerHTML;
+      return out;
+    }
+
+    async function fetchHtml(url) {
+      const target = PROXY ? (PROXY + encodeURIComponent(url)) : url;
+
+      const res = await fetch(target, {
+        method: "GET",
+        // When using a proxy, it should set proper CORS headers.
+        // With direct fetch, this only succeeds if the target allows it.
+        mode: "cors",
+        credentials: "omit",
+        redirect: "follow",
+        headers: {
+          "Accept": "text/html,application/xhtml+xml"
+        }
+      });
+
+      if (!res.ok) {
+        throw new Error(`Fetch failed: HTTP ${res.status} ${res.statusText}`);
+      }
+
+      const ct = (res.headers.get("content-type") || "").toLowerCase();
+      const text = await res.text();
+
+      // If the target returns non-HTML, we still try, but warn.
+      if (!ct.includes("text/html") && !text.toLowerCase().includes("<html")) {
+        console.warn("Response may not be HTML. content-type:", ct);
+      }
+
+      return text;
+    }
+
+    async function load() {
+      clearError();
+      goBtn.disabled = true;
+
+      const url = normalizeUrl(urlInput.value);
+      if (!url) {
+        showError("Please enter a valid URL.");
+        goBtn.disabled = false;
+        return;
+      }
+
+      try {
+        const html = await fetchHtml(url);
+        const rewritten = rewriteHtmlToRunStandalone(html, url);
+
+        // Hide UI and show iframe
+        ui.style.display = "none";
+        viewer.style.display = "block";
+
+        // Render using srcdoc (HTML source code injection)
+        viewer.srcdoc = rewritten;
+
+      } catch (e) {
+        const msg =
+`Could not load that site.
+
+Most common reasons:
+- CORS blocks fetching HTML from the browser (very common)
+- CSP blocks scripts/styles inside iframes (also common)
+- The site requires cookies/auth and won’t work anonymously
+
+Error:
+${String(e && e.message ? e.message : e)}`;
+
+        showError(msg);
+        goBtn.disabled = false;
+      }
+    }
+
+    goBtn.addEventListener("click", load);
+    urlInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") load();
+    });
+
+    // Autofocus
+    urlInput.focus();
+  </script>
+</body>
+</html>
